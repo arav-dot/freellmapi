@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">OmniPilot</string>
+    <string name="accessibility_description">Allows OmniPilot to perform user-authorized taps, swipes and text entry requested by the automation loop.</string>
+</resources>
