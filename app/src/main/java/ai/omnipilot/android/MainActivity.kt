@@ -7,6 +7,8 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.widget.*
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 
@@ -15,13 +17,25 @@ class MainActivity : ComponentActivity() {
     private lateinit var goal: EditText
     private lateinit var status: TextView
     private lateinit var autoExecute: Switch
+    private val statusHandler = Handler(Looper.getMainLooper())
+    private val statusRefresh = object : Runnable {
+        override fun run() {
+            if (::status.isInitialized) {
+                val prefs = getSharedPreferences("omni", MODE_PRIVATE)
+                val state = prefs.getString("lastStatus", "READY") ?: "READY"
+                val detail = prefs.getString("lastDetail", "") ?: ""
+                status.text = if (detail.isBlank()) state else "$state\n$detail"
+            }
+            statusHandler.postDelayed(this, 1000)
+        }
+    }
 
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
             VisionService.start(this, result.resultCode, result.data!!)
-            status.text = "RUNNING • vision loop active"
+            status.text = "STARTING • requesting screen capture"
         } else status.text = "Screen capture permission denied"
     }
 
@@ -119,5 +133,11 @@ class MainActivity : ComponentActivity() {
         box.addView(stop)
 
         setContentView(box)
+        statusHandler.post(statusRefresh)
+    }
+
+    override fun onDestroy() {
+        statusHandler.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 }
