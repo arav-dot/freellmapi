@@ -195,7 +195,7 @@ class VisionService : Service() {
                             updateNotification("Server error ${it.code}")
                             return
                         }
-                        if (j.optString("status") != "ok") {
+                        if (j.optString("status") == "error") {
                             busy = false
                             setStatus("VISION ERROR", j.optString("diagnostic", j.optString("summary", "Unknown vision error")))
                             updateNotification("Vision error")
