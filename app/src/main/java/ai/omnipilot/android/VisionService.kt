@@ -21,7 +21,9 @@ import java.util.concurrent.TimeUnit
 
 class VisionService : Service() {
     private var projection: MediaProjection? = null
+    private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
     private var reader: ImageReader? = null
+    private var projectionCallback: MediaProjection.Callback? = null
     private var running = false
     private var token = ""
     private var goal = ""
@@ -33,13 +35,16 @@ class VisionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        tts = TextToSpeech(this) { tts?.language = Locale.US }
+        tts = TextToSpeech(this) { result ->
+            if (result == TextToSpeech.SUCCESS) tts?.language = Locale.US
+        }
         ServiceCompat.startForeground(
             this,
             42,
-            notification(),
+            notification("Starting vision service"),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         )
+        setStatus("READY", "Service started")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -53,31 +58,60 @@ class VisionService : Service() {
             @Suppress("DEPRECATION")
             intent?.getParcelableExtra("data")
         } ?: return START_NOT_STICKY
-        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = mgr.getMediaProjection(code, data)
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                running = false
-                handler.removeCallbacksAndMessages(null)
-                reader?.close()
-                reader = null
-                stopSelf()
+        if (token.isBlank()) {
+            setStatus("ERROR", "Pairing token is empty")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (OmniPilotAccessibilityService.instance == null && autoExecute) {
+            setStatus("WARNING", "Accessibility is OFF, so actions cannot run")
+        }
+        return try {
+            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = mgr.getMediaProjection(code, data)
+            if (projection == null) throw IllegalStateException("Android returned no MediaProjection")
+            val callback = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    running = false
+                    busy = false
+                    handler.removeCallbacksAndMessages(null)
+                    reader?.close()
+                    reader = null
+                    virtualDisplay?.release()
+                    virtualDisplay = null
+                    setStatus("STOPPED", "Android stopped screen capture")
+                    stopSelf()
+                }
             }
-        }, handler)
-        setupCapture()
-        running = true
-        loop()
-        return START_NOT_STICKY
+            projectionCallback = callback
+            projection?.registerCallback(callback, handler)
+            setupCapture()
+            running = true
+            setStatus("CAPTURE OK", "Screen capture is active")
+            updateNotification("Screen capture active")
+            loop()
+            START_NOT_STICKY
+        } catch (e: SecurityException) {
+            setStatus("ERROR", "MediaProjection blocked: ${e.message ?: "permission/security error"}")
+            stopSelf()
+            START_NOT_STICKY
+        } catch (e: Exception) {
+            setStatus("ERROR", "Capture setup failed: ${e.message ?: e.javaClass.simpleName}")
+            stopSelf()
+            START_NOT_STICKY
+        }
     }
 
     private fun setupCapture() {
         val dm = resources.displayMetrics
         reader = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, android.graphics.PixelFormat.RGBA_8888, 2)
-        projection?.createVirtualDisplay(
+        virtualDisplay?.release()
+        virtualDisplay = projection?.createVirtualDisplay(
             "OmniPilot",
             dm.widthPixels, dm.heightPixels, dm.densityDpi,
             0, reader!!.surface, null, null
         )
+        if (virtualDisplay == null) throw IllegalStateException("Virtual display was not created")
     }
 
     private fun loop() {
@@ -89,7 +123,10 @@ class VisionService : Service() {
     }
 
     private fun captureAndAsk() {
-        val image = reader?.acquireLatestImage() ?: return
+        val image = try { reader?.acquireLatestImage() } catch (e: Exception) {
+            setStatus("ERROR", "Screenshot read failed: ${e.message ?: e.javaClass.simpleName}")
+            null
+        } ?: return
         busy = true
         try {
             val plane = image.planes[0]
@@ -109,10 +146,18 @@ class VisionService : Service() {
             val out = ByteArrayOutputStream()
             cropped.compress(android.graphics.Bitmap.CompressFormat.JPEG, 55, out)
             cropped.recycle()
-            askGemini(out.toByteArray())
-        } catch (_: Exception) {
-            image.close()
+            val jpeg = out.toByteArray()
+            if (jpeg.isEmpty()) {
+                setStatus("ERROR", "Screenshot compression returned empty data")
+                busy = false
+                return
+            }
+            setStatus("UPLOADING", "Sending ${jpeg.size / 1024} KB to Gemini")
+            askGemini(jpeg)
+        } catch (e: Exception) {
+            try { image.close() } catch (_: Exception) {}
             busy = false
+            setStatus("ERROR", "Screenshot processing failed: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
@@ -123,36 +168,83 @@ class VisionService : Service() {
         val body = jpeg.toRequestBody("image/jpeg".toMediaType())
         val req = Request.Builder().url(url).post(body).build()
         client.newCall(req).enqueue(object: Callback {
-            override fun onFailure(call: Call, e: java.io.IOException) { busy = false }
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                busy = false
+                setStatus("NETWORK ERROR", e.message ?: "Could not reach OmniPilot server")
+                updateNotification("Network error")
+            }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
+                    val raw = it.body?.string().orEmpty()
                     try {
-                        val j = JSONObject(it.body?.string() ?: "{}")
-                        if (j.optString("status") == "ok") {
-                            j.optString("voiceCue").takeIf { s -> s.isNotBlank() }?.let { speak(it) }
-                            val action = j.optJSONObject("action")
-                            val confidence = j.optDouble("confidence", 0.0)
-                            if (autoExecute && confidence >= 0.72 && action != null && action.optString("type") != "none") {
-                                execute(action)
-                            }
+                        val j = if (raw.isNotBlank()) JSONObject(raw) else JSONObject()
+                        if (!it.isSuccessful) {
+                            busy = false
+                            setStatus("SERVER ERROR", "HTTP ${it.code}: ${raw.take(120)}")
+                            updateNotification("Server error ${it.code}")
+                            return
                         }
-                    } catch (_: Exception) {}
-                    busy = false
+                        if (j.optString("status") != "ok") {
+                            busy = false
+                            setStatus("VISION ERROR", j.optString("diagnostic", j.optString("summary", "Unknown vision error")))
+                            updateNotification("Vision error")
+                            return
+                        }
+                        val action = j.optJSONObject("action")
+                        val actionType = action?.optString("type", "none") ?: "none"
+                        val confidence = j.optDouble("confidence", 0.0)
+                        val summary = j.optString("summary", "Screen analyzed")
+                        j.optString("voiceCue").takeIf { s -> s.isNotBlank() }?.let { speak(it) }
+                        if (actionType == "none" || actionType == "wait") {
+                            setStatus("GEMINI OK", "$summary • no action • ${percent(confidence)}%")
+                        } else if (!autoExecute) {
+                            setStatus("ACTION READY", "$actionType • ${percent(confidence)}% • Auto-execute OFF")
+                        } else if (confidence < 0.72) {
+                            setStatus("ACTION HELD", "$actionType • confidence ${percent(confidence)}% < 72%")
+                        } else if (OmniPilotAccessibilityService.instance == null) {
+                            setStatus("ACTION BLOCKED", "Accessibility is OFF • proposed $actionType")
+                        } else {
+                            val ok = execute(action)
+                            setStatus(if (ok) "ACTION SENT" else "ACTION FAILED", "$actionType • ${percent(confidence)}% • $summary")
+                            updateNotification(if (ok) "Action sent: $actionType" else "Action failed: $actionType")
+                        }
+                    } catch (e: Exception) {
+                        setStatus("PARSE ERROR", "Invalid server response: ${e.message ?: "unknown"}")
+                    } finally {
+                        busy = false
+                    }
                 }
             }
         })
     }
 
-    private fun execute(a: JSONObject) {
-        when (a.optString("type")) {
-            "tap" -> OmniPilotAccessibilityService.instance?.tap(a.optDouble("x").toFloat(), a.optDouble("y").toFloat())
+    private fun execute(a: JSONObject?): Boolean {
+        if (a == null) return false
+        return when (a.optString("type")) {
+            "tap" -> OmniPilotAccessibilityService.instance?.tap(a.optDouble("x").toFloat(), a.optDouble("y").toFloat()) ?: false
             "swipe" -> OmniPilotAccessibilityService.instance?.swipe(
                 a.optDouble("x").toFloat(), a.optDouble("y").toFloat(),
                 a.optDouble("x2").toFloat(), a.optDouble("y2").toFloat()
-            )
-            "type" -> OmniPilotAccessibilityService.instance?.typeText(a.optString("text"))
-            "key" -> OmniPilotAccessibilityService.instance?.pressEnter()
+            ) ?: false
+            "type" -> OmniPilotAccessibilityService.instance?.typeText(a.optString("text")) ?: false
+            "key" -> OmniPilotAccessibilityService.instance?.pressEnter() ?: false
+            else -> false
         }
+    }
+
+    private fun percent(value: Double): Int = (value.coerceIn(0.0, 1.0) * 100.0).toInt()
+
+    private fun setStatus(state: String, detail: String) {
+        getSharedPreferences("omni", 0).edit()
+            .putString("lastStatus", state)
+            .putString("lastDetail", detail.take(220))
+            .putLong("lastStatusAt", System.currentTimeMillis())
+            .apply()
+    }
+
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(42, notification(text))
     }
 
     private fun speak(s: String) {
@@ -161,13 +253,13 @@ class VisionService : Service() {
         }
     }
 
-    private fun notification(): Notification {
+    private fun notification(text: String = "Vision → action loop active"): Notification {
         val channel = "omni"
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(NotificationChannel(channel, "OmniPilot", NotificationManager.IMPORTANCE_LOW))
         return Notification.Builder(this, channel)
             .setContentTitle("OmniPilot is running")
-            .setContentText("Vision → action loop active")
+            .setContentText(text.take(80))
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .build()
     }
@@ -175,8 +267,13 @@ class VisionService : Service() {
     override fun onDestroy() {
         running = false
         handler.removeCallbacksAndMessages(null)
+        try { projectionCallback?.let { projection?.unregisterCallback(it) } } catch (_: Exception) {}
+        virtualDisplay?.release()
+        virtualDisplay = null
         projection?.stop()
+        projection = null
         reader?.close()
+        reader = null
         tts?.shutdown()
         super.onDestroy()
     }
