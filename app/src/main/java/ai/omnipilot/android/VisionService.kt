@@ -3,13 +3,14 @@ package ai.omnipilot.android
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.app.Activity
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.speech.tts.TextToSpeech
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
