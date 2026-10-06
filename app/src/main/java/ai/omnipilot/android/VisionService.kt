@@ -165,8 +165,14 @@ class VisionService : Service() {
         val url = "https://omnipilot-jo6bv8.v2.appdeploy.ai/api/agent/android-vision?token=" +
                 java.net.URLEncoder.encode(token, "UTF-8") +
                 "&goal=" + java.net.URLEncoder.encode(goal, "UTF-8")
-        val body = jpeg.toRequestBody("image/jpeg".toMediaType())
-        val req = Request.Builder().url(url).post(body).build()
+        val encoded = android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)
+        val requestJson = JSONObject().put("data", encoded).toString()
+        val body = requestJson.toRequestBody("application/json".toMediaType())
+        val req = Request.Builder()
+            .url(url)
+            .post(body)
+            .header("Accept", "application/json")
+            .build()
         client.newCall(req).enqueue(object: Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
                 busy = false
