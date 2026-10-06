@@ -6,6 +6,8 @@ import android.content.Intent
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.content.pm.ServiceInfo
+import androidx.core.app.ServiceCompat
 import android.os.*
 import android.speech.tts.TextToSpeech
 import okhttp3.*
@@ -32,7 +34,7 @@ class VisionService : Service() {
     override fun onCreate() {
         super.onCreate()
         tts = TextToSpeech(this) { tts?.language = Locale.US }
-        startForeground(42, notification())
+        ServiceCompat.startForeground(\n            this,\n            42,\n            notification(),\n            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION\n        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -40,7 +42,7 @@ class VisionService : Service() {
         goal = getSharedPreferences("omni", 0).getString("goal", "Assist me with the current Android screen.") ?: ""
         autoExecute = getSharedPreferences("omni", 0).getBoolean("autoExecute", false)
         val code = intent?.getIntExtra("resultCode", 0) ?: 0
-        val data = intent?.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
+        val data = if (Build.VERSION.SDK_INT >= 33) {\n            intent?.getParcelableExtra("data", Intent::class.java)\n        } else {\n            @Suppress("DEPRECATION")\n            intent?.getParcelableExtra("data")\n        } ?: return START_NOT_STICKY
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(code, data)
         setupCapture()
