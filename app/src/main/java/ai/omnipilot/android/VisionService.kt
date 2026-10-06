@@ -162,16 +162,21 @@ class VisionService : Service() {
     }
 
     private fun askGemini(jpeg: ByteArray) {
-        val url = "https://omnipilot-jo6bv8.v2.appdeploy.ai/api/agent/android-vision?token=" +
-                java.net.URLEncoder.encode(token, "UTF-8") +
-                "&goal=" + java.net.URLEncoder.encode(goal, "UTF-8")
+        val url = "https://omnipilot-jo6bv8.v2.appdeploy.ai/api/agent/vision?token=" +
+                java.net.URLEncoder.encode(token, "UTF-8")
         val encoded = android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)
-        val requestJson = JSONObject().put("data", encoded).toString()
+        val requestJson = JSONObject()
+            .put("goal", goal)
+            .put("image", encoded)
+            .put("mimeType", "image/jpeg")
+            .put("approved", false)
+            .toString()
         val body = requestJson.toRequestBody("application/json".toMediaType())
         val req = Request.Builder()
             .url(url)
             .post(body)
             .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
             .build()
         client.newCall(req).enqueue(object: Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
@@ -215,7 +220,8 @@ class VisionService : Service() {
                             updateNotification(if (ok) "Action sent: $actionType" else "Action failed: $actionType")
                         }
                     } catch (e: Exception) {
-                        setStatus("PARSE ERROR", "Invalid server response: ${e.message ?: "unknown"}")
+                        val preview = raw.replace("\n", " ").take(180)
+                        setStatus("RESPONSE ERROR", "HTTP " + it.code + ", content-type " + (it.header("Content-Type") ?: "unknown") + " • " + preview)
                     } finally {
                         busy = false
                     }
