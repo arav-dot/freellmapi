@@ -34,7 +34,12 @@ class VisionService : Service() {
     override fun onCreate() {
         super.onCreate()
         tts = TextToSpeech(this) { tts?.language = Locale.US }
-        ServiceCompat.startForeground(\n            this,\n            42,\n            notification(),\n            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION\n        )
+        ServiceCompat.startForeground(
+            this,
+            42,
+            notification(),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -42,7 +47,12 @@ class VisionService : Service() {
         goal = getSharedPreferences("omni", 0).getString("goal", "Assist me with the current Android screen.") ?: ""
         autoExecute = getSharedPreferences("omni", 0).getBoolean("autoExecute", false)
         val code = intent?.getIntExtra("resultCode", 0) ?: 0
-        val data = if (Build.VERSION.SDK_INT >= 33) {\n            intent?.getParcelableExtra("data", Intent::class.java)\n        } else {\n            @Suppress("DEPRECATION")\n            intent?.getParcelableExtra("data")\n        } ?: return START_NOT_STICKY
+        val data = if (Build.VERSION.SDK_INT >= 33) {
+            intent?.getParcelableExtra("data", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra("data")
+        } ?: return START_NOT_STICKY
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(code, data)
         projection?.registerCallback(object : MediaProjection.Callback() {
