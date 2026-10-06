@@ -43,6 +43,6 @@ class OmniPilotAccessibilityService : AccessibilityService() {
     fun pressEnter(): Boolean {
         val root = rootInActiveWindow ?: return false
         val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
-        return node.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
+        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
     }
 }
