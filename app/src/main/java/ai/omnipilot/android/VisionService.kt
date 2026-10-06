@@ -45,6 +45,15 @@ class VisionService : Service() {
         val data = if (Build.VERSION.SDK_INT >= 33) {\n            intent?.getParcelableExtra("data", Intent::class.java)\n        } else {\n            @Suppress("DEPRECATION")\n            intent?.getParcelableExtra("data")\n        } ?: return START_NOT_STICKY
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(code, data)
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                running = false
+                handler.removeCallbacksAndMessages(null)
+                reader?.close()
+                reader = null
+                stopSelf()
+            }
+        }, handler)
         setupCapture()
         running = true
         loop()
