@@ -11,6 +11,8 @@ import androidx.core.app.ServiceCompat
 import android.os.*
 import android.speech.tts.TextToSpeech
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -169,7 +171,7 @@ class VisionService : Service() {
             .put("mimeType", "image/jpeg")
             .put("approved", false)
             .toString()
-        val body = RequestBody.create(MediaType.parse("application/json"), requestJson)
+        val body = requestJson.toRequestBody("application/json".toMediaType())
         val req = Request.Builder()
             .url(url)
             .post(body)
