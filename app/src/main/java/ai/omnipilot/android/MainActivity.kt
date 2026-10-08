@@ -1,5 +1,6 @@
 package ai.omnipilot.android
 
+import android.app.Activity
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
@@ -7,40 +8,44 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.widget.*
-import android.os.Handler
-import android.os.Looper
-import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 
-class MainActivity : ComponentActivity() {
+class MainActivity : Activity() {
     private lateinit var token: EditText
     private lateinit var goal: EditText
     private lateinit var status: TextView
     private lateinit var autoExecute: Switch
-    private val statusHandler = Handler(Looper.getMainLooper())
-    private val statusRefresh = object : Runnable {
-        override fun run() {
-            if (::status.isInitialized) {
-                val prefs = getSharedPreferences("omni", MODE_PRIVATE)
-                val state = prefs.getString("lastStatus", "READY") ?: "READY"
-                val detail = prefs.getString("lastDetail", "") ?: ""
-                status.text = if (detail.isBlank()) state else "$state\n$detail"
-            }
-            statusHandler.postDelayed(this, 1000)
-        }
-    }
 
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
-            VisionService.start(this, result.resultCode, result.data!!)
-            status.text = "STARTING • requesting screen capture"
-        } else status.text = "Screen capture permission denied"
+            val sessionToken = pendingToken
+            pendingToken = ""
+            token.text?.clear()
+            if (sessionToken.isNotBlank()) {
+                try {
+                    VisionService.start(this, result.resultCode, result.data!!, sessionToken)
+                    status.text = "STARTING • check the service notification"
+                } catch (_: Exception) {
+                    status.text = "Could not start OmniPilot"
+                }
+            } else {
+                status.text = "Screen capture permission denied"
+            }
+        } else {
+            pendingToken = ""
+            token.text?.clear()
+            status.text = "Screen capture permission denied"
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val preferences = getSharedPreferences("omni", MODE_PRIVATE)
+        // Pairing credentials are session input, not a preference. Also clear
+        // any plaintext value saved by an earlier app version.
+        preferences.edit().remove("token").apply()
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -58,13 +63,13 @@ class MainActivity : ComponentActivity() {
         token = EditText(this).apply {
             hint = "Private pairing token"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(getSharedPreferences("omni", MODE_PRIVATE).getString("token", ""))
+            isSaveEnabled = false
             setTextColor(0xFFE7EDF5.toInt())
             setHintTextColor(0xFF8190A3.toInt())
         }
         goal = EditText(this).apply {
             hint = "What should OmniPilot do?"
-            setText("Assist me with the current Android screen.")
+            setText(getSharedPreferences("omni", MODE_PRIVATE).getString("goal", "Assist me with the current Android screen."))
             setTextColor(0xFFE7EDF5.toInt())
             setHintTextColor(0xFF8190A3.toInt())
         }
@@ -90,13 +95,14 @@ class MainActivity : ComponentActivity() {
         val start = Button(this).apply {
             text = "START OMNIPILOT"
             setOnClickListener {
-                getSharedPreferences("omni", MODE_PRIVATE).edit()
-                    .putString("token", token.text.toString())
+                preferences.edit()
                     .putString("goal", goal.text.toString())
                     .putBoolean("autoExecute", autoExecute.isChecked)
                     .apply()
                 if (!token.text.isNullOrBlank()) {
                     val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    pendingToken = token.text.toString()
+                    token.text?.clear()
                     captureLauncher.launch(mgr.createScreenCaptureIntent())
                 } else status.text = "Enter a pairing token first"
             }
@@ -104,7 +110,9 @@ class MainActivity : ComponentActivity() {
         val stop = Button(this).apply {
             text = "EMERGENCY STOP"
             setOnClickListener {
-                VisionService.stop(this@MainActivity)
+                pendingToken = ""
+                token.text?.clear()
+                VisionService.stop(this)
                 status.text = "STOPPED"
             }
         }
@@ -133,11 +141,7 @@ class MainActivity : ComponentActivity() {
         box.addView(stop)
 
         setContentView(box)
-        statusHandler.post(statusRefresh)
     }
 
-    override fun onDestroy() {
-        statusHandler.removeCallbacksAndMessages(null)
-        super.onDestroy()
-    }
+    private var pendingToken: String = ""
 }

@@ -4,15 +4,13 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.media.ImageReader
+import android.hardware.display.VirtualDisplay
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.content.pm.ServiceInfo
-import androidx.core.app.ServiceCompat
 import android.os.*
+import android.content.pm.ServiceInfo
 import android.speech.tts.TextToSpeech
 import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -21,113 +19,107 @@ import java.util.concurrent.TimeUnit
 
 class VisionService : Service() {
     private var projection: MediaProjection? = null
-    private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
+    private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private var projectionCallback: MediaProjection.Callback? = null
-    private var running = false
+    @Volatile private var running = false
     private var token = ""
     private var goal = ""
     private var tts: TextToSpeech? = null
     private val client = OkHttpClient.Builder().callTimeout(15, TimeUnit.SECONDS).build()
     private val handler = Handler(Looper.getMainLooper())
-    private var busy = false
+    @Volatile private var busy = false
     private var autoExecute = false
+    private var screenWidth = 0
+    private var screenHeight = 0
+    private var projectionCallback: MediaProjection.Callback? = null
+    @Volatile private var activeCall: Call? = null
+    @Volatile private var sessionGeneration = 0
+    @Volatile private var retryDelayMs = 1_500L
 
     override fun onCreate() {
         super.onCreate()
-        tts = TextToSpeech(this) { result ->
-            if (result == TextToSpeech.SUCCESS) tts?.language = Locale.US
+        instance = this
+        tts = TextToSpeech(this) { tts?.language = Locale.US }
+        val foregroundNotification = notification("Starting screen capture")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                42,
+                foregroundNotification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(42, foregroundNotification)
         }
-        ServiceCompat.startForeground(
-            this,
-            42,
-            notification("Starting vision service"),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-        )
-        setStatus("READY", "Service started")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        token = getSharedPreferences("omni", 0).getString("token", "") ?: ""
+        releaseCaptureResources()
+        token = intent?.getStringExtra("token") ?: ""
         goal = getSharedPreferences("omni", 0).getString("goal", "Assist me with the current Android screen.") ?: ""
         autoExecute = getSharedPreferences("omni", 0).getBoolean("autoExecute", false)
         val code = intent?.getIntExtra("resultCode", 0) ?: 0
-        val data = if (Build.VERSION.SDK_INT >= 33) {
-            intent?.getParcelableExtra("data", Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent?.getParcelableExtra("data")
-        } ?: return START_NOT_STICKY
-        if (token.isBlank()) {
-            setStatus("ERROR", "Pairing token is empty")
-            stopSelf()
+        val data = intent?.getParcelableExtra<Intent>("data")
+        if (code == 0 || data == null || token.isBlank()) {
+            stopSelf(startId)
             return START_NOT_STICKY
         }
-        if (OmniPilotAccessibilityService.instance == null && autoExecute) {
-            setStatus("WARNING", "Accessibility is OFF, so actions cannot run")
-        }
-        return try {
-            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        try {
             projection = mgr.getMediaProjection(code, data)
-            if (projection == null) throw IllegalStateException("Android returned no MediaProjection")
-            val callback = object : MediaProjection.Callback() {
+            if (projection == null) {
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            projectionCallback = object : MediaProjection.Callback() {
                 override fun onStop() {
                     running = false
-                    busy = false
-                    handler.removeCallbacksAndMessages(null)
-                    reader?.close()
-                    reader = null
-                    virtualDisplay?.release()
-                    virtualDisplay = null
-                    setStatus("STOPPED", "Android stopped screen capture")
                     stopSelf()
                 }
-            }
-            projectionCallback = callback
-            projection?.registerCallback(callback, handler)
+            }.also { projection?.registerCallback(it, handler) }
             setupCapture()
             running = true
-            setStatus("CAPTURE OK", "Screen capture is active")
-            updateNotification("Screen capture active")
+            retryDelayMs = 1_500L
+            updateNotification("Vision loop active")
             loop()
-            START_NOT_STICKY
-        } catch (e: SecurityException) {
-            setStatus("ERROR", "MediaProjection blocked: ${e.message ?: "permission/security error"}")
-            stopSelf()
-            START_NOT_STICKY
-        } catch (e: Exception) {
-            setStatus("ERROR", "Capture setup failed: ${e.message ?: e.javaClass.simpleName}")
-            stopSelf()
-            START_NOT_STICKY
+        } catch (_: Exception) {
+            updateNotification("Could not start screen capture")
+            stopSelf(startId)
         }
+        return START_NOT_STICKY
     }
 
     private fun setupCapture() {
         val dm = resources.displayMetrics
+        screenWidth = dm.widthPixels
+        screenHeight = dm.heightPixels
         reader = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, android.graphics.PixelFormat.RGBA_8888, 2)
-        virtualDisplay?.release()
         virtualDisplay = projection?.createVirtualDisplay(
             "OmniPilot",
             dm.widthPixels, dm.heightPixels, dm.densityDpi,
             0, reader!!.surface, null, null
-        )
-        if (virtualDisplay == null) throw IllegalStateException("Virtual display was not created")
+        ) ?: throw IllegalStateException("Screen capture display could not be created")
     }
 
-    private fun loop() {
+    private fun loop(delayMs: Long = 1_500L) {
         if (!running) return
         handler.postDelayed({
             if (running && !busy) captureAndAsk()
-            loop()
-        }, 1500)
+        }, delayMs)
+    }
+
+    private fun increaseRetryDelay() {
+        retryDelayMs = (retryDelayMs * 2).coerceAtMost(30_000L)
     }
 
     private fun captureAndAsk() {
-        val image = try { reader?.acquireLatestImage() } catch (e: Exception) {
-            setStatus("ERROR", "Screenshot read failed: ${e.message ?: e.javaClass.simpleName}")
-            null
-        } ?: return
+        val image = try { reader?.acquireLatestImage() } catch (_: Exception) { null }
+        if (image == null) {
+            loop()
+            return
+        }
         busy = true
+        var bmp: android.graphics.Bitmap? = null
+        var cropped: android.graphics.Bitmap? = null
         try {
             val plane = image.planes[0]
             val buffer: ByteBuffer = plane.buffer
@@ -136,169 +128,211 @@ class VisionService : Service() {
             val width = image.width
             val height = image.height
             val rowPadding = rowStride - pixelStride * width
-            val bmp = android.graphics.Bitmap.createBitmap(width + rowPadding / pixelStride, height, android.graphics.Bitmap.Config.ARGB_8888)
-            bmp.copyPixelsFromBuffer(buffer)
-            image.close()
-
-            val cropped = if (bmp.width != width) android.graphics.Bitmap.createBitmap(bmp, 0, 0, width, height) else bmp
-            if (cropped !== bmp) bmp.recycle()
+            val rawBitmap = android.graphics.Bitmap.createBitmap(
+                width + rowPadding / pixelStride, height, android.graphics.Bitmap.Config.ARGB_8888
+            )
+            bmp = rawBitmap
+            rawBitmap.copyPixelsFromBuffer(buffer)
+            val captureBitmap = if (rawBitmap.width != width)
+                android.graphics.Bitmap.createBitmap(rawBitmap, 0, 0, width, height)
+            else rawBitmap
+            cropped = captureBitmap
 
             val out = ByteArrayOutputStream()
-            cropped.compress(android.graphics.Bitmap.CompressFormat.JPEG, 55, out)
-            cropped.recycle()
-            val jpeg = out.toByteArray()
-            if (jpeg.isEmpty()) {
-                setStatus("ERROR", "Screenshot compression returned empty data")
+            if (!captureBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 55, out)) {
                 busy = false
+                loop()
                 return
             }
-            setStatus("UPLOADING", "Sending ${jpeg.size / 1024} KB to Gemini")
-            askGemini(jpeg)
-        } catch (e: Exception) {
-            try { image.close() } catch (_: Exception) {}
+            askGemini(out.toByteArray())
+        } catch (_: Exception) {
             busy = false
-            setStatus("ERROR", "Screenshot processing failed: ${e.message ?: e.javaClass.simpleName}")
+            loop()
+        } finally {
+            try {
+                image.close()
+            } finally {
+                if (cropped !== bmp) cropped?.recycle()
+                bmp?.recycle()
+            }
         }
     }
 
     private fun askGemini(jpeg: ByteArray) {
-        val url = "https://omnipilot-jo6bv8.v2.appdeploy.ai/api/agent/vision?token=" +
-                java.net.URLEncoder.encode(token, "UTF-8")
-        val encoded = android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)
+        val url = "https://omnipilot-jo6bv8.v2.appdeploy.ai/api/agent/vision"
         val requestJson = JSONObject()
             .put("goal", goal)
-            .put("image", encoded)
+            .put("image", android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP))
             .put("mimeType", "image/jpeg")
-            .put("approved", false)
-            .toString()
-        val body = requestJson.toRequestBody("application/json".toMediaType())
+            .put("approved", autoExecute)
+        val body = requestJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
         val req = Request.Builder()
             .url(url)
+            .header("Authorization", "Bearer $token")
             .post(body)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
             .build()
-        client.newCall(req).enqueue(object: Callback {
+        val call = client.newCall(req)
+        val requestGeneration = sessionGeneration
+        activeCall = call
+        call.enqueue(object: Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
-                busy = false
-                setStatus("NETWORK ERROR", e.message ?: "Could not reach OmniPilot server")
-                updateNotification("Network error")
+                if (sessionGeneration == requestGeneration) {
+                    if (activeCall === call) activeCall = null
+                    busy = false
+                    if (running) {
+                        updateNotification("Connection failed; retrying")
+                        increaseRetryDelay()
+                        handler.post { if (running && sessionGeneration == requestGeneration) loop(retryDelayMs) }
+                    }
+                }
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    val raw = it.body?.string().orEmpty()
+                    var requestSucceeded = false
+                    var authenticationRejected = false
                     try {
-                        val j = if (raw.isNotBlank()) JSONObject(raw) else JSONObject()
-                        if (!it.isSuccessful) {
-                            busy = false
-                            setStatus("SERVER ERROR", "HTTP ${it.code}: ${raw.take(120)}")
-                            updateNotification("Server error ${it.code}")
-                            return
+                        if (running && sessionGeneration == requestGeneration && !it.isSuccessful) {
+                            authenticationRejected = it.code == 401 || it.code == 403
+                            updateNotification(if (authenticationRejected)
+                                "Pairing token rejected; stopping OmniPilot"
+                            else "Backend request failed (HTTP ${it.code}); retrying")
+                        } else if (running && sessionGeneration == requestGeneration && it.isSuccessful) {
+                            val j = JSONObject(it.body?.string() ?: "{}")
+                            if (j.optString("status") == "ok") {
+                                requestSucceeded = true
+                                updateNotification("Vision loop active")
+                                j.optString("voiceCue").takeIf { s -> s.isNotBlank() }?.let { speak(it) }
+                                val action = j.optJSONObject("action")
+                                val confidence = j.optDouble("confidence", Double.NaN)
+                                if (running && sessionGeneration == requestGeneration && autoExecute &&
+                                    confidence.isFinite() && confidence in 0.72..1.0 &&
+                                    action != null && action.optString("type") != "none"
+                                ) {
+                                    handler.post {
+                                        if (running && sessionGeneration == requestGeneration) execute(action)
+                                    }
+                                }
+                            } else {
+                                updateNotification("Invalid backend response; retrying")
+                            }
                         }
-                        if (j.optString("status") == "error") {
-                            busy = false
-                            setStatus("VISION ERROR", j.optString("diagnostic", j.optString("summary", "Unknown vision error")))
-                            updateNotification("Vision error")
-                            return
-                        }
-                        val action = j.optJSONObject("action")
-                        val actionType = action?.optString("type", "none") ?: "none"
-                        val confidence = j.optDouble("confidence", 0.0)
-                        val summary = j.optString("summary", "Screen analyzed")
-                        j.optString("voiceCue").takeIf { s -> s.isNotBlank() }?.let { speak(it) }
-                        if (actionType == "none" || actionType == "wait") {
-                            setStatus("GEMINI OK", "$summary • no action • ${percent(confidence)}%")
-                        } else if (!autoExecute) {
-                            setStatus("ACTION READY", "$actionType • ${percent(confidence)}% • Auto-execute OFF")
-                        } else if (confidence < 0.72) {
-                            setStatus("ACTION HELD", "$actionType • confidence ${percent(confidence)}% < 72%")
-                        } else if (OmniPilotAccessibilityService.instance == null) {
-                            setStatus("ACTION BLOCKED", "Accessibility is OFF • proposed $actionType")
-                        } else {
-                            val ok = execute(action)
-                            setStatus(if (ok) "ACTION SENT" else "ACTION FAILED", "$actionType • ${percent(confidence)}% • $summary")
-                            updateNotification(if (ok) "Action sent: $actionType" else "Action failed: $actionType")
-                        }
-                    } catch (e: Exception) {
-                        val preview = raw.replace("\n", " ").take(180)
-                        setStatus("RESPONSE ERROR", "HTTP " + it.code + ", content-type " + (it.header("Content-Type") ?: "unknown") + " • " + preview)
-                    } finally {
+                    } catch (_: Exception) {
+                        if (running && sessionGeneration == requestGeneration)
+                            updateNotification("Invalid backend response; retrying")
+                    }
+                    if (sessionGeneration == requestGeneration) {
+                        if (activeCall === call) activeCall = null
                         busy = false
+                        if (authenticationRejected) {
+                            running = false
+                            stopSelf()
+                        }
+                        if (running) {
+                            if (requestSucceeded) retryDelayMs = 1_500L else increaseRetryDelay()
+                            handler.post {
+                                if (running && sessionGeneration == requestGeneration) loop(retryDelayMs)
+                            }
+                        }
                     }
                 }
             }
         })
     }
 
-    private fun execute(a: JSONObject?): Boolean {
-        if (a == null) return false
-        return when (a.optString("type")) {
-            "tap" -> OmniPilotAccessibilityService.instance?.tap(a.optDouble("x").toFloat(), a.optDouble("y").toFloat()) ?: false
-            "swipe" -> OmniPilotAccessibilityService.instance?.swipe(
-                a.optDouble("x").toFloat(), a.optDouble("y").toFloat(),
-                a.optDouble("x2").toFloat(), a.optDouble("y2").toFloat()
-            ) ?: false
-            "type" -> OmniPilotAccessibilityService.instance?.typeText(a.optString("text")) ?: false
-            "key" -> OmniPilotAccessibilityService.instance?.pressEnter() ?: false
-            else -> false
+    private fun execute(a: JSONObject) {
+        fun coordinate(key: String, limit: Int): Float? {
+            val value = a.optDouble(key, Double.NaN)
+            if (!value.isFinite() || value < 0.0 || value >= limit.toDouble()) return null
+            return value.toFloat()
         }
-    }
-
-    private fun percent(value: Double): Int = (value.coerceIn(0.0, 1.0) * 100.0).toInt()
-
-    private fun setStatus(state: String, detail: String) {
-        getSharedPreferences("omni", 0).edit()
-            .putString("lastStatus", state)
-            .putString("lastDetail", detail.take(220))
-            .putLong("lastStatusAt", System.currentTimeMillis())
-            .apply()
-    }
-
-    private fun updateNotification(text: String) {
-        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(42, notification(text))
+        when (a.optString("type")) {
+            "tap" -> {
+                val x = coordinate("x", screenWidth)
+                val y = coordinate("y", screenHeight)
+                if (x != null && y != null) OmniPilotAccessibilityService.instance?.tap(x, y)
+            }
+            "swipe" -> {
+                val x = coordinate("x", screenWidth)
+                val y = coordinate("y", screenHeight)
+                val x2 = coordinate("x2", screenWidth)
+                val y2 = coordinate("y2", screenHeight)
+                if (x != null && y != null && x2 != null && y2 != null)
+                    OmniPilotAccessibilityService.instance?.swipe(x, y, x2, y2)
+            }
+            "type" -> a.optString("text").takeIf { it.isNotBlank() && it.length <= 500 }
+                ?.let { OmniPilotAccessibilityService.instance?.typeText(it) }
+            "key" -> OmniPilotAccessibilityService.instance?.pressEnter()
+        }
     }
 
     private fun speak(s: String) {
         Handler(Looper.getMainLooper()).post {
-            tts?.speak(s.take(180), TextToSpeech.QUEUE_FLUSH, null, "omni")
+            if (running) tts?.speak(s.take(180), TextToSpeech.QUEUE_FLUSH, null, "omni")
         }
     }
 
-    private fun notification(text: String = "Vision → action loop active"): Notification {
+    private fun notification(message: String): Notification {
         val channel = "omni"
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(NotificationChannel(channel, "OmniPilot", NotificationManager.IMPORTANCE_LOW))
         return Notification.Builder(this, channel)
-            .setContentTitle("OmniPilot is running")
-            .setContentText(text.take(80))
+            .setContentTitle("OmniPilot")
+            .setContentText(message)
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .build()
     }
 
-    override fun onDestroy() {
+    private fun updateNotification(message: String) {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(42, notification(message))
+    }
+
+    private fun releaseCaptureResources() {
+        sessionGeneration += 1
         running = false
         handler.removeCallbacksAndMessages(null)
-        try { projectionCallback?.let { projection?.unregisterCallback(it) } } catch (_: Exception) {}
+        activeCall?.cancel()
+        activeCall = null
         virtualDisplay?.release()
         virtualDisplay = null
-        projection?.stop()
-        projection = null
         reader?.close()
         reader = null
+        projectionCallback?.let { projection?.unregisterCallback(it) }
+        projectionCallback = null
+        projection?.stop()
+        projection = null
+        busy = false
+        retryDelayMs = 1_500L
+        token = ""
+    }
+
+    override fun onDestroy() {
+        releaseCaptureResources()
         tts?.shutdown()
+        if (instance === this) instance = null
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?) = null
 
     companion object {
-        fun start(context: Context, resultCode: Int, data: Intent) {
+        @Volatile private var instance: VisionService? = null
+
+        fun start(context: Context, resultCode: Int, data: Intent, token: String) {
             context.startForegroundService(Intent(context, VisionService::class.java).apply {
                 putExtra("resultCode", resultCode)
                 putExtra("data", data)
+                putExtra("token", token)
             })
         }
-        fun stop(context: Context) { context.stopService(Intent(context, VisionService::class.java)) }
+        fun stop(context: Context) {
+            instance?.stopSession()
+            context.stopService(Intent(context, VisionService::class.java))
+        }
+    }
+
+    private fun stopSession() {
+        releaseCaptureResources()
+        stopSelf()
     }
 }

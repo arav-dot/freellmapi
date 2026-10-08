@@ -20,18 +20,29 @@ class OmniPilotAccessibilityService : AccessibilityService() {
     }
 
     fun tap(x: Float, y: Float): Boolean {
+        val metrics = resources.displayMetrics
+        if (!x.isFinite() || !y.isFinite() || x < 0f || y < 0f ||
+            x >= metrics.widthPixels || y >= metrics.heightPixels
+        ) return false
         val path = Path().apply { moveTo(x, y) }
         val stroke = GestureDescription.StrokeDescription(path, 0, 80)
         return dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
     }
 
     fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, duration: Long = 350): Boolean {
+        val metrics = resources.displayMetrics
+        if (!x1.isFinite() || !y1.isFinite() || !x2.isFinite() || !y2.isFinite() ||
+            x1 < 0f || y1 < 0f || x2 < 0f || y2 < 0f ||
+            x1 >= metrics.widthPixels || x2 >= metrics.widthPixels ||
+            y1 >= metrics.heightPixels || y2 >= metrics.heightPixels || duration !in 1..2_000
+        ) return false
         val path = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
         val stroke = GestureDescription.StrokeDescription(path, 0, duration)
         return dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
     }
 
     fun typeText(text: String): Boolean {
+        if (text.length > 500) return false
         val root = rootInActiveWindow ?: return false
         val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
         val args = Bundle().apply {
@@ -43,6 +54,6 @@ class OmniPilotAccessibilityService : AccessibilityService() {
     fun pressEnter(): Boolean {
         val root = rootInActiveWindow ?: return false
         val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
-        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        return node.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
     }
 }
