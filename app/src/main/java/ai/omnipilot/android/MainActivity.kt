@@ -3,6 +3,8 @@ package ai.omnipilot.android
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
@@ -15,6 +17,20 @@ class MainActivity : ComponentActivity() {
     private lateinit var goal: EditText
     private lateinit var status: TextView
     private lateinit var autoExecute: Switch
+    private val statusHandler = Handler(Looper.getMainLooper())
+    private val statusPoll = object : Runnable {
+        override fun run() {
+            val serviceStatus = VisionService.sessionStatus()
+            if (serviceStatus != null) {
+                status.text = serviceStatus
+                if (serviceStatus.startsWith("STOPPED") || serviceStatus.startsWith("ERROR")) {
+                    token.visibility = android.view.View.VISIBLE
+                    token.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                }
+            }
+            statusHandler.postDelayed(this, 500L)
+        }
+    }
 
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -29,13 +45,19 @@ class MainActivity : ComponentActivity() {
                     status.text = "STARTING • check the service notification"
                 } catch (_: Exception) {
                     status.text = "Could not start OmniPilot"
+                    token.visibility = android.view.View.VISIBLE
+                    token.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 }
             } else {
+                token.visibility = android.view.View.VISIBLE
+                token.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 status.text = "Screen capture permission denied"
             }
         } else {
             pendingToken = ""
             token.text?.clear()
+            token.visibility = android.view.View.VISIBLE
+            token.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             status.text = "Screen capture permission denied"
         }
     }
@@ -103,7 +125,14 @@ class MainActivity : ComponentActivity() {
                     val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     pendingToken = token.text.toString()
                     token.text?.clear()
-                    captureLauncher.launch(mgr.createScreenCaptureIntent())
+                    token.visibility = android.view.View.GONE
+                    try {
+                        captureLauncher.launch(mgr.createScreenCaptureIntent())
+                    } catch (_: Exception) {
+                        pendingToken = ""
+                        token.visibility = android.view.View.VISIBLE
+                        status.text = "Could not request screen capture permission"
+                    }
                 } else status.text = "Enter a pairing token first"
             }
         }
@@ -114,6 +143,8 @@ class MainActivity : ComponentActivity() {
                 token.text?.clear()
                 VisionService.stop(this@MainActivity)
                 status.text = "STOPPED"
+                token.visibility = android.view.View.VISIBLE
+                token.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
         }
 
@@ -141,6 +172,17 @@ class MainActivity : ComponentActivity() {
         box.addView(stop)
 
         setContentView(box)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        statusHandler.removeCallbacks(statusPoll)
+        statusHandler.post(statusPoll)
+    }
+
+    override fun onPause() {
+        statusHandler.removeCallbacks(statusPoll)
+        super.onPause()
     }
 
     private var pendingToken: String = ""

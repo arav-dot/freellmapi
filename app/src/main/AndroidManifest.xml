@@ -8,6 +8,7 @@
         android:theme="@style/Theme.OmniPilot"
         android:label="OmniPilot"
         android:allowBackup="false"
+        android:resizeableActivity="true"
         android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

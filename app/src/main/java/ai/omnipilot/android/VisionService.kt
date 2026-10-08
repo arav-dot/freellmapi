@@ -1,13 +1,17 @@
 package ai.omnipilot.android
 
 import android.app.*
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.hardware.display.DisplayManager
 import android.media.ImageReader
 import android.hardware.display.VirtualDisplay
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
+import android.util.Log
+import android.view.WindowManager
 import android.content.pm.ServiceInfo
 import android.speech.tts.TextToSpeech
 import okhttp3.*
@@ -37,20 +41,31 @@ class VisionService : Service() {
     @Volatile private var activeCall: Call? = null
     @Volatile private var sessionGeneration = 0
     @Volatile private var retryDelayMs = 1_500L
+    private var foregroundReady = false
+    private var releasing = false
+    private var reportedMissingFrame = false
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         tts = TextToSpeech(this) { tts?.language = Locale.US }
         val foregroundNotification = notification("Starting screen capture")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                42,
-                foregroundNotification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(42, foregroundNotification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    42,
+                    foregroundNotification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(42, foregroundNotification)
+            }
+            foregroundReady = true
+            publishStatus("STARTING")
+        } catch (e: Exception) {
+            Log.e(TAG, "Media projection foreground startup failed (${e.javaClass.simpleName})")
+            publishStatus("ERROR: foreground service startup failed")
+            stopSelf()
         }
     }
 
@@ -60,8 +75,15 @@ class VisionService : Service() {
         goal = getSharedPreferences("omni", 0).getString("goal", "Assist me with the current Android screen.") ?: ""
         autoExecute = getSharedPreferences("omni", 0).getBoolean("autoExecute", false)
         val code = intent?.getIntExtra("resultCode", 0) ?: 0
-        val data = intent?.getParcelableExtra<Intent>("data")
-        if (code == 0 || data == null || token.isBlank()) {
+        val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra("data", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra<Intent>("data")
+        }
+        if (!foregroundReady || code != Activity.RESULT_OK || data == null || token.isBlank()) {
+            publishStatus("ERROR: screen capture session could not start")
+            Log.e(TAG, "Media projection startup rejected (foreground=$foregroundReady, result=${code == Activity.RESULT_OK}, data=${data != null}, tokenPresent=${token.isNotBlank()})")
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -69,13 +91,22 @@ class VisionService : Service() {
         try {
             projection = mgr.getMediaProjection(code, data)
             if (projection == null) {
+                publishStatus("ERROR: Android did not provide screen capture")
                 stopSelf(startId)
                 return START_NOT_STICKY
             }
             projectionCallback = object : MediaProjection.Callback() {
                 override fun onStop() {
                     running = false
+                    publishStatus("STOPPED: screen sharing ended")
+                    Log.i(TAG, "Media projection stopped by Android or user")
+                    releaseCaptureResources(stopProjection = false)
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
+                }
+
+                override fun onCapturedContentResize(width: Int, height: Int) {
+                    resizeCapture(width, height)
                 }
             }.also { projection?.registerCallback(it, handler) }
             setupCapture()
@@ -83,8 +114,12 @@ class VisionService : Service() {
             retryDelayMs = 1_500L
             updateNotification("Vision loop active")
             loop()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Media projection setup failed (${e.javaClass.simpleName})")
             updateNotification("Could not start screen capture")
+            publishStatus("ERROR: screen capture setup failed")
+            releaseCaptureResources()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf(startId)
         }
         return START_NOT_STICKY
@@ -92,14 +127,38 @@ class VisionService : Service() {
 
     private fun setupCapture() {
         val dm = resources.displayMetrics
-        screenWidth = dm.widthPixels
-        screenHeight = dm.heightPixels
-        reader = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, android.graphics.PixelFormat.RGBA_8888, 2)
+        val bounds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).maximumWindowMetrics.bounds
+        } else null
+        screenWidth = bounds?.width() ?: dm.widthPixels
+        screenHeight = bounds?.height() ?: dm.heightPixels
+        reader = ImageReader.newInstance(screenWidth, screenHeight, android.graphics.PixelFormat.RGBA_8888, 2)
         virtualDisplay = projection?.createVirtualDisplay(
             "OmniPilot",
-            dm.widthPixels, dm.heightPixels, dm.densityDpi,
-            0, reader!!.surface, null, null
+            screenWidth, screenHeight, dm.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler
         ) ?: throw IllegalStateException("Screen capture display could not be created")
+        Log.i(TAG, "Media projection virtual display created")
+    }
+
+    private fun resizeCapture(width: Int, height: Int) {
+        if (!running || width <= 0 || height <= 0 || width > 16_384 || height > 16_384) return
+        try {
+            val densityDpi = resources.displayMetrics.densityDpi
+            val replacement = ImageReader.newInstance(width, height, android.graphics.PixelFormat.RGBA_8888, 2)
+            virtualDisplay?.resize(width, height, densityDpi)
+            virtualDisplay?.setSurface(replacement.surface)
+            val previous = reader
+            reader = replacement
+            previous?.close()
+            screenWidth = width
+            screenHeight = height
+            Log.i(TAG, "Media projection surface resized to ${width}x${height}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Media projection resize failed (${e.javaClass.simpleName})")
+            publishStatus("ERROR: screen capture resize failed")
+            stopSession()
+        }
     }
 
     private fun loop(delayMs: Long = 1_500L) {
@@ -116,9 +175,16 @@ class VisionService : Service() {
     private fun captureAndAsk() {
         val image = try { reader?.acquireLatestImage() } catch (_: Exception) { null }
         if (image == null) {
+            if (!reportedMissingFrame) {
+                reportedMissingFrame = true
+                Log.w(TAG, "Media projection is active but no frame is available yet")
+            }
+            publishStatus("STARTING: waiting for first frame")
             loop()
             return
         }
+        reportedMissingFrame = false
+        publishStatus("ACTIVE")
         busy = true
         var bmp: android.graphics.Bitmap? = null
         var cropped: android.graphics.Bitmap? = null
@@ -147,7 +213,8 @@ class VisionService : Service() {
                 return
             }
             askGemini(out.toByteArray())
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Frame capture failed (${e.javaClass.simpleName})")
             busy = false
             loop()
         } finally {
@@ -289,7 +356,13 @@ class VisionService : Service() {
         nm.notify(42, notification(message))
     }
 
-    private fun releaseCaptureResources() {
+    private fun publishStatus(message: String) {
+        sessionStatusValue = message
+    }
+
+    private fun releaseCaptureResources(stopProjection: Boolean = true) {
+        if (releasing) return
+        releasing = true
         sessionGeneration += 1
         running = false
         handler.removeCallbacksAndMessages(null)
@@ -301,11 +374,12 @@ class VisionService : Service() {
         reader = null
         projectionCallback?.let { projection?.unregisterCallback(it) }
         projectionCallback = null
-        projection?.stop()
+        if (stopProjection) projection?.stop()
         projection = null
         busy = false
         retryDelayMs = 1_500L
         token = ""
+        releasing = false
     }
 
     override fun onDestroy() {
@@ -318,9 +392,14 @@ class VisionService : Service() {
     override fun onBind(intent: Intent?) = null
 
     companion object {
+        private const val TAG = "OmniPilotVision"
         @Volatile private var instance: VisionService? = null
+        @Volatile private var sessionStatusValue: String? = null
+
+        fun sessionStatus(): String? = sessionStatusValue
 
         fun start(context: Context, resultCode: Int, data: Intent, token: String) {
+            sessionStatusValue = "STARTING"
             context.startForegroundService(Intent(context, VisionService::class.java).apply {
                 putExtra("resultCode", resultCode)
                 putExtra("data", data)
@@ -328,6 +407,7 @@ class VisionService : Service() {
             })
         }
         fun stop(context: Context) {
+            sessionStatusValue = "STOPPED"
             instance?.stopSession()
             context.stopService(Intent(context, VisionService::class.java))
         }
@@ -335,6 +415,8 @@ class VisionService : Service() {
 
     private fun stopSession() {
         releaseCaptureResources()
+        publishStatus("STOPPED")
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 }
