@@ -11,6 +11,8 @@ import android.os.*
 import android.content.pm.ServiceInfo
 import android.speech.tts.TextToSpeech
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer

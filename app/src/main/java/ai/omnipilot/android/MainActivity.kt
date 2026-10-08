@@ -1,6 +1,5 @@
 package ai.omnipilot.android
 
-import android.app.Activity
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
@@ -8,9 +7,10 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.widget.*
+import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     private lateinit var token: EditText
     private lateinit var goal: EditText
     private lateinit var status: TextView
@@ -112,7 +112,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 pendingToken = ""
                 token.text?.clear()
-                VisionService.stop(this)
+                VisionService.stop(this@MainActivity)
                 status.text = "STOPPED"
             }
         }
