@@ -132,7 +132,7 @@ class VisionService : Service() {
         } else null
         screenWidth = bounds?.width() ?: dm.widthPixels
         screenHeight = bounds?.height() ?: dm.heightPixels
-        reader = ImageReader.newInstance(screenWidth, screenHeight, android.graphics.PixelFormat.RGBA_8888, 2)
+        reader = createImageReader(screenWidth, screenHeight)
         virtualDisplay = projection?.createVirtualDisplay(
             "OmniPilot",
             screenWidth, screenHeight, dm.densityDpi,
@@ -141,11 +141,18 @@ class VisionService : Service() {
         Log.i(TAG, "Media projection virtual display created")
     }
 
+    private fun createImageReader(width: Int, height: Int): ImageReader =
+        ImageReader.newInstance(width, height, android.graphics.PixelFormat.RGBA_8888, 2).apply {
+            setOnImageAvailableListener({
+                if (running && !busy) captureAndAsk()
+            }, handler)
+        }
+
     private fun resizeCapture(width: Int, height: Int) {
         if (!running || width <= 0 || height <= 0 || width > 16_384 || height > 16_384) return
         try {
             val densityDpi = resources.displayMetrics.densityDpi
-            val replacement = ImageReader.newInstance(width, height, android.graphics.PixelFormat.RGBA_8888, 2)
+            val replacement = createImageReader(width, height)
             virtualDisplay?.resize(width, height, densityDpi)
             virtualDisplay?.setSurface(replacement.surface)
             val previous = reader
@@ -173,15 +180,23 @@ class VisionService : Service() {
     }
 
     private fun captureAndAsk() {
-        val image = try { reader?.acquireLatestImage() } catch (_: Exception) { null }
+        val image = try {
+            reader?.acquireLatestImage()
+        } catch (e: Exception) {
+            Log.e(TAG, "ImageReader frame acquisition failed (${e.javaClass.simpleName})")
+            null
+        }
         if (image == null) {
             if (!reportedMissingFrame) {
                 reportedMissingFrame = true
-                Log.w(TAG, "Media projection is active but no frame is available yet")
+                Log.w(TAG, "No MediaProjection frame yet (reader=${reader != null}, display=${virtualDisplay != null}, size=${screenWidth}x${screenHeight})")
             }
             publishStatus("STARTING: waiting for first frame")
             loop()
             return
+        }
+        if (reportedMissingFrame) {
+            Log.i(TAG, "First MediaProjection frame received (${image.width}x${image.height})")
         }
         reportedMissingFrame = false
         publishStatus("ACTIVE")
