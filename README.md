@@ -15,6 +15,7 @@ Native Android companion for the OmniPilot vision/action backend.
   - swipe
   - text entry
   - Enter
+  - home navigation and installed-app launch by app name
 - Gemini vision through the existing OmniPilot backend
 - 72% confidence gate
 - Voice cues using Android TTS
@@ -53,7 +54,7 @@ This is intended for normal, user-authorized Android automation. It does not byp
 
 ## Important implementation note
 
-The companion sends screenshots to the existing OmniPilot `/api/agent/android-vision` endpoint. The endpoint should return:
+The companion sends screenshots to the configured OmniPilot `/api/agent/vision` endpoint. The endpoint should return:
 
 ```json
 {
@@ -69,6 +70,8 @@ The companion sends screenshots to the existing OmniPilot `/api/agent/android-vi
 }
 ```
 
-Actions below the confidence threshold or `type: "none"` are not executed.
+Actions below the confidence threshold or `type: "none"` are not executed. With auto-execution enabled,
+OmniPilot can use taps and swipes for game controls, enter text into the focused field, return to Home,
+and launch an installed app by its visible name.
 
 The Android project is source-complete for the native control path, but this chat environment does not have an Android SDK/build host attached, so an APK has not been falsely claimed as compiled here.

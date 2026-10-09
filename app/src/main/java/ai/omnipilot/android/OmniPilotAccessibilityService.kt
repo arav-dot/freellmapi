@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.os.Bundle
+import android.content.Intent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -50,6 +51,34 @@ class OmniPilotAccessibilityService : AccessibilityService() {
         }
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
+
+    fun openApp(appName: String): Boolean {
+        val requestedName = appName.trim()
+        if (requestedName.isEmpty() || requestedName.length > 100) return false
+
+        val launcherQuery = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val matches = packageManager.queryIntentActivities(launcherQuery, 0)
+            .mapNotNull { resolveInfo ->
+                val packageName = resolveInfo.activityInfo?.packageName ?: return@mapNotNull null
+                val label = resolveInfo.loadLabel(packageManager).toString()
+                packageName.takeIf {
+                    packageName.equals(requestedName, ignoreCase = true) ||
+                        label.equals(requestedName, ignoreCase = true)
+                }
+            }
+            .distinct()
+        val packageName = matches.singleOrNull() ?: return false
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName) ?: return false
+        return try {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launchIntent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun goHome(): Boolean = performGlobalAction(GLOBAL_ACTION_HOME)
 
     fun pressEnter(): Boolean {
         val root = rootInActiveWindow ?: return false

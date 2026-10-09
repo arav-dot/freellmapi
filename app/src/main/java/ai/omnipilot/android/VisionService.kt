@@ -245,7 +245,12 @@ class VisionService : Service() {
     private fun askGemini(jpeg: ByteArray) {
         val url = "https://omnipilot-jo6bv8.v2.appdeploy.ai/api/agent/vision"
         val requestJson = JSONObject()
-            .put("goal", goal)
+            .put("goal", """$goal
+
+                Available controls: tap, swipe, type, key. To return to the home screen, emit
+                {"type":"home"}. To open an installed app, emit
+                {"type":"open_app","appName":"exact visible app name"}.
+            """.trimIndent())
             .put("image", android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP))
             .put("mimeType", "image/jpeg")
             .put("approved", autoExecute)
@@ -346,6 +351,9 @@ class VisionService : Service() {
             "type" -> a.optString("text").takeIf { it.isNotBlank() && it.length <= 500 }
                 ?.let { OmniPilotAccessibilityService.instance?.typeText(it) }
             "key" -> OmniPilotAccessibilityService.instance?.pressEnter()
+            "home" -> OmniPilotAccessibilityService.instance?.goHome()
+            "open_app" -> a.optString("appName").takeIf { it.isNotBlank() && it.length <= 100 }
+                ?.let { OmniPilotAccessibilityService.instance?.openApp(it) }
         }
     }
 
